@@ -15,6 +15,7 @@ tokio = { version = "1", features = [
     "io-util",
     "net",
     "macros",
+    "time",
     "sync",
 ] }
 winit = "0.30.12"

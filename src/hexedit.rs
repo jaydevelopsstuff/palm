@@ -3,12 +3,14 @@ use eframe::egui::text_edit::TextEditState;
 use eframe::egui::{self, TextEdit};
 use eframe::egui::{Key, Widget};
 use eframe::epaint::text::cursor;
+use regex::Regex;
 
 use crate::util::hex_encode_formatted;
 
 pub struct HexEditor<'a> {
     buffer: &'a mut Vec<u8>,
     view: String,
+    desired_width: Option<f32>,
 }
 
 impl<'a> HexEditor<'a> {
@@ -28,7 +30,16 @@ impl<'a> HexEditor<'a> {
                 })
                 .collect::<String>(),
             buffer,
+            desired_width: None,
         }
+    }
+
+    /// Set to 0.0 to keep as small as possible.
+    /// Set to [`f32::INFINITY`] to take up all available space (i.e. disable automatic word wrap).
+    #[inline]
+    pub fn desired_width(mut self, desired_width: f32) -> Self {
+        self.desired_width = Some(desired_width);
+        self
     }
 
     fn handle_event(&self, event: &egui::Event, ctx: &egui::Context) -> (EventHandleResult, bool) {
@@ -148,7 +159,7 @@ impl<'a> HexEditor<'a> {
                             cursor_range.secondary.index = cursor_range.primary.index;
                             state.cursor.set_char_range(Some(cursor_range));
                         }
-                    } else {
+                    } else if Regex::new(r"^[0-9A-Fa-f]+$").unwrap().is_match(&text) {
                         partial_nibble.0 = Some(text.chars().next().unwrap());
                     }
                 }
@@ -175,7 +186,13 @@ impl Widget for HexEditor<'_> {
                 !should_consume
             });
         });
-        let output = TextEdit::multiline(&mut self.view).show(ui);
+        let mut textedit = TextEdit::multiline(&mut self.view);
+
+        if let Some(desired_width) = self.desired_width {
+            textedit = textedit.desired_width(desired_width);
+        }
+
+        let output = textedit.show(ui);
 
         let mut state = output.state.clone();
         let mut partial_nibble = PartialNibble(None);

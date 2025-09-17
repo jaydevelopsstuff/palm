@@ -1,13 +1,17 @@
-use std::sync::{atomic::Ordering, Arc};
+use std::{
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
 
 use atomic_enum::atomic_enum;
 use chrono::DateTime;
-use log::info;
+use log::{debug, info};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     runtime::Runtime,
     select,
+    time::timeout,
 };
 
 pub struct Tab {
@@ -64,16 +68,28 @@ impl Tab {
         let mut shutdown_rx_r = self.shutdown_rx.clone();
         let mut shutdown_rx_w = self.shutdown_rx.clone();
         let shutdown_tx = self.shutdown_tx.clone();
+        let shutdown_tx_r = self.shutdown_tx.clone();
         let log_tx = self.log_tx.clone();
         let mut sender_rx = self.sender_tx.subscribe();
         let net_state = self.net_state.clone();
         net_state.store(NetState::Establishing, Ordering::Relaxed);
 
         self.rt.spawn(async move {
-            let Ok(stream) = TcpStream::connect(&address).await else {
-                info!("Failed to establish connection to {}", address);
-                net_state.store(NetState::Inactive, Ordering::Relaxed);
-                return;
+            let stream;
+            match timeout(Duration::from_secs(8), TcpStream::connect(&address)).await {
+                Ok(Ok(active_stream)) => stream = active_stream,
+                Ok(Err(error)) => {
+                    info!("Failed to establish connection to {}", address);
+                    log_tx.send(Log::connect_error(error)).await.unwrap();
+                    net_state.store(NetState::Inactive, Ordering::Relaxed);
+                    return;
+                }
+                Err(_) => {
+                    info!("Failed to establish connection to {}: Timed Out", address);
+                    log_tx.send(Log::connect_timed_out()).await.unwrap();
+                    net_state.store(NetState::Inactive, Ordering::Relaxed);
+                    return;
+                }
             };
             let (mut reader, mut writer) = stream.into_split();
             net_state.store(NetState::Active, Ordering::Relaxed);
@@ -93,11 +109,23 @@ impl Tab {
                             }
                         },
                         result = reader.read(&mut read_data) => {
-                            let read_bytes = result.unwrap();
+                            let read_bytes = match result {
+                                Ok(c) => c,
+                                Err(error) => {
+                                    if error.kind() == std::io::ErrorKind::Interrupted {
+                                        continue;
+                                    } else {
+                                        info!("Connection Closed Due to Fatal Read Error: {error}");
+                                        r_log_tx.send(Log::fatal_read_error(error)).await.unwrap();
+                                        shutdown_tx_r.send(true).unwrap();
+                                        break;
+                                    }
+                                }
+                            };
 
-                            if read_bytes == 0 {
-                                // Peer closed connection
-                                break;
+                            if read_bytes == 0 { // Peer closed connection
+                                info!("Peer {r_address} closed connection");
+                                shutdown_tx_r.send(true).unwrap();
                             } else {
                                 r_log_tx
                                     .send(Log::received(DataPacket::new(r_address.clone(), read_data[0..read_bytes].to_vec()))).await.unwrap();
@@ -189,6 +217,18 @@ impl Log {
     pub fn received(data: DataPacket) -> Self {
         Self::new(LogData::ReceivedPacket(data))
     }
+
+    pub fn connect_error(error: std::io::Error) -> Self {
+        Self::new(LogData::ConnectError(error))
+    }
+
+    pub fn connect_timed_out() -> Self {
+        Self::new(LogData::ConnectTimedOut)
+    }
+
+    pub fn fatal_read_error(error: std::io::Error) -> Self {
+        Self::new(LogData::FatalReadError(error))
+    }
 }
 
 #[derive(Debug)]
@@ -197,6 +237,9 @@ pub enum LogData {
     Disconnect,
     ReceivedPacket(DataPacket),
     SentPacket(DataPacket),
+    ConnectError(std::io::Error),
+    ConnectTimedOut,
+    FatalReadError(std::io::Error),
 }
 
 #[derive(Clone, Debug)]
