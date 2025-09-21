@@ -9,11 +9,13 @@ use eframe::{egui, Frame};
 use simplelog::*;
 use tokio::runtime::Runtime;
 
-use crate::backend::{LogData, Mode, NetState, Tab};
+use crate::backend::{LogData, Mode, NetState};
+use crate::gui::Tab;
 use crate::hexedit::HexEditor;
 use crate::util::hex_encode_formatted;
 
 pub mod backend;
+pub mod gui;
 pub mod hexedit;
 pub mod util;
 
@@ -86,6 +88,8 @@ impl Palm {
 
 impl eframe::App for Palm {
     fn update(&mut self, ctx: &Context, frame: &mut Frame) {
+        let net_state = self.focused_tab().net_state();
+
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let mut tab_clicked: Option<u32> = None;
@@ -112,7 +116,7 @@ impl eframe::App for Palm {
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(
-                        self.focused_tab().net_state() == NetState::Inactive,
+                        net_state == NetState::Inactive,
                         egui::Button::new("Client")
                             .selected(self.focused_tab().mode() == Mode::Client),
                     )
@@ -122,7 +126,7 @@ impl eframe::App for Palm {
                 }
                 if ui
                     .add_enabled(
-                        self.focused_tab().net_state() == NetState::Inactive,
+                        net_state == NetState::Inactive,
                         egui::Button::new("Server")
                             .selected(self.focused_tab().mode() == Mode::Server),
                     )
@@ -132,9 +136,8 @@ impl eframe::App for Palm {
                 }
                 ui.separator();
                 if self.focused_tab().mode() == Mode::Client {
-                    let net_state = self.focused_tab().net_state();
                     ui.add(
-                        TextEdit::singleline(&mut self.focused_tab_mut().address)
+                        TextEdit::singleline(&mut self.focused_tab_mut().client_mut().address)
                             .desired_width(172.0)
                             .hint_text("127.0.0.1:54321")
                             .interactive(net_state == NetState::Inactive),
@@ -147,7 +150,7 @@ impl eframe::App for Palm {
                         }
                         NetState::Active => {
                             if ui.button("Disconnect").clicked() {
-                                self.focused_tab().shutdown();
+                                self.focused_tab().client().backend().shutdown();
                             }
                         }
                         NetState::Establishing => {
@@ -160,13 +163,18 @@ impl eframe::App for Palm {
         // egui::SidePanel::right("text_panel").show(ctx, |ui| {});
         egui::TopBottomPanel::bottom("input_panel").show(ctx, |ui| {
             ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
-                ui.add(
-                    HexEditor::new(&mut self.focused_tab_mut().to_send_data)
+                let mut empty_draft_data = Vec::new();
+                let draft_data = self.focused_tab_mut().draft_data_mut();
+                let has_draft_data = draft_data.is_some();
+
+                ui.add_enabled(
+                    draft_data.is_some(),
+                    HexEditor::new(draft_data.unwrap_or(&mut empty_draft_data))
                         .desired_width(ui.available_width() - 64.),
                 );
                 if ui
                     .add_enabled(
-                        self.focused_tab().net_state() == NetState::Active,
+                        net_state == NetState::Active && has_draft_data,
                         Button::new("Send"),
                     )
                     .clicked()
@@ -177,46 +185,62 @@ impl eframe::App for Palm {
         });
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for log in self.focused_tab_mut().update_and_read_logs() {
-                    ui.horizontal(|ui| {
-                        ui.monospace(log.timestamp.format("%H:%M:%S").to_string());
-                        match &log.data {
-                            LogData::Connect => {
-                                ui.monospace("Connected");
-                            }
-                            LogData::Disconnect => {
-                                ui.monospace("Disconnected");
-                            }
-                            LogData::SentPacket(packet) => {
-                                ui.add_sized((108., 20.), Label::new("You"));
-                                let mut hex_formatted = hex_encode_formatted(&packet.data);
-                                ui.add(
-                                    TextEdit::multiline(&mut hex_formatted)
-                                        .code_editor()
-                                        .desired_width(f32::INFINITY),
-                                );
-                            }
-                            LogData::ReceivedPacket(packet) => {
-                                ui.add_sized((108., 20.), Label::new(&packet.address));
-                                let mut hex_formatted = hex_encode_formatted(&packet.data);
-                                ui.add(
-                                    TextEdit::multiline(&mut hex_formatted)
-                                        .code_editor()
-                                        .desired_width(f32::INFINITY),
-                                );
-                            }
-                            LogData::ConnectTimedOut => {
-                                ui.monospace("Failed to Connect: Timed Out");
-                            }
-                            LogData::ConnectError(error) => {
-                                ui.monospace(format!("Failed to Connect: {}", error));
-                            }
-                            LogData::FatalReadError(error) => {
-                                ui.monospace(format!("Fatal Read Error: {error}"));
-                            }
-                            _ => (),
-                        };
-                    });
+                if self.focused_tab().mode() == Mode::Client {
+                    let server_log_focused = matches!(
+                        self.focused_tab()
+                            .server_safe()
+                            .and_then(|s| Some(s.is_server_log_focused())),
+                        Some(true)
+                    );
+
+                    for log in self.focused_tab_mut().update_and_read_logs() {
+                        ui.horizontal(|ui| {
+                            ui.monospace(log.timestamp.format("%H:%M:%S").to_string());
+                            match &log.data {
+                                LogData::ClientConnect(addr) => {
+                                    ui.monospace(if server_log_focused {
+                                        format!("{} Connected", addr)
+                                    } else {
+                                        "Connected".into()
+                                    });
+                                }
+                                LogData::ClientDisconnect(addr) => {
+                                    ui.monospace(if server_log_focused {
+                                        format!("{} Disconnected", addr)
+                                    } else {
+                                        "Disconnected".into()
+                                    });
+                                }
+                                LogData::SentPacket(packet) => {
+                                    ui.add_sized((108., 20.), Label::new("You"));
+                                    let mut hex_formatted = hex_encode_formatted(&packet.data);
+                                    ui.add(
+                                        TextEdit::multiline(&mut hex_formatted)
+                                            .code_editor()
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                }
+                                LogData::ReceivedPacket(packet) => {
+                                    ui.add_sized((108., 20.), Label::new(&packet.address));
+                                    let mut hex_formatted = hex_encode_formatted(&packet.data);
+                                    ui.add(
+                                        TextEdit::multiline(&mut hex_formatted)
+                                            .code_editor()
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                }
+                                LogData::ConnectTimedOut => {
+                                    ui.monospace("Failed to Connect: Timed Out");
+                                }
+                                LogData::ConnectError(error) => {
+                                    ui.monospace(format!("Failed to Connect: {}", error));
+                                }
+                                LogData::FatalReadError(error) => {
+                                    ui.monospace(format!("Fatal Read Error: {error}"));
+                                }
+                            };
+                        });
+                    }
                 }
             })
         });

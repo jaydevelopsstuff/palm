@@ -14,17 +14,11 @@ use tokio::{
     time::timeout,
 };
 
-pub struct Tab {
-    pub id: u32,
-
-    pub address: String,
-    pub to_send_data: Vec<u8>,
-
-    mode: Mode,
+pub struct Connection {
+    address: Option<String>,
     net_state: Arc<AtomicNetState>,
     logs: Vec<Log>,
 
-    rt: Arc<Runtime>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     log_tx: tokio::sync::mpsc::Sender<Log>,
@@ -33,18 +27,14 @@ pub struct Tab {
     sender_rx: tokio::sync::broadcast::Receiver<DataPacket>,
 }
 
-impl Tab {
-    pub fn new(id: u32, rt: Arc<Runtime>) -> Self {
+impl Connection {
+    pub fn new() -> Self {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (log_tx, log_rx) = tokio::sync::mpsc::channel(1024);
         let (sender_tx, sender_rx) = tokio::sync::broadcast::channel(1024);
 
         Self {
-            id,
-            rt,
-            mode: Mode::default(),
-            address: String::default(),
-            to_send_data: Vec::new(),
+            address: None,
             net_state: Arc::new(AtomicNetState::new(NetState::default())),
             logs: Vec::new(),
             shutdown_tx,
@@ -56,15 +46,13 @@ impl Tab {
         }
     }
 
-    pub fn start_client(&mut self) {
-        if self.mode() != Mode::Client {
-            panic!("Must be in client mode to start_client")
-        }
+    pub fn start_client(&mut self, address: String, rt: &Runtime) {
         if self.net_state() != NetState::Inactive {
             panic!("Cannot start_client if connection establishing or already established")
         }
 
-        let address = self.address.clone();
+        self.address = Some(address.clone());
+
         let mut shutdown_rx_r = self.shutdown_rx.clone();
         let mut shutdown_rx_w = self.shutdown_rx.clone();
         let shutdown_tx = self.shutdown_tx.clone();
@@ -74,7 +62,7 @@ impl Tab {
         let net_state = self.net_state.clone();
         net_state.store(NetState::Establishing, Ordering::Relaxed);
 
-        self.rt.spawn(async move {
+        rt.spawn(async move {
             let stream;
             match timeout(Duration::from_secs(8), TcpStream::connect(&address)).await {
                 Ok(Ok(active_stream)) => stream = active_stream,
@@ -93,7 +81,7 @@ impl Tab {
             };
             let (mut reader, mut writer) = stream.into_split();
             net_state.store(NetState::Active, Ordering::Relaxed);
-            log_tx.send(Log::connect()).await.unwrap();
+            log_tx.send(Log::connect(address.clone())).await.unwrap();
 
             info!("Connected to {}", address);
 
@@ -156,20 +144,16 @@ impl Tab {
             tokio::join!(reader_task, writer_task);
             shutdown_tx.send(false).unwrap();
             net_state.store(NetState::Inactive, Ordering::Relaxed);
-            log_tx.send(Log::disconnect()).await.unwrap();
             info!("Disconnected from {}", address);
+            log_tx.send(Log::disconnect(address)).await.unwrap();
         });
     }
 
-    pub fn send_data(&mut self) -> anyhow::Result<()> {
-        let packet = DataPacket::new("".to_string(), self.to_send_data.drain(..).collect());
+    pub fn send_data(&mut self, data: Vec<u8>) -> anyhow::Result<()> {
+        let packet = DataPacket::new("".to_string(), data);
         self.sender_tx.send(packet.clone())?;
         self.logs.push(Log::new(LogData::SentPacket(packet)));
         Ok(())
-    }
-
-    pub fn shutdown(&self) {
-        self.shutdown_tx.send(true).unwrap();
     }
 
     pub fn update_and_read_logs(&mut self) -> &Vec<Log> {
@@ -179,16 +163,86 @@ impl Tab {
         &self.logs
     }
 
+    pub fn shutdown(&self) {
+        self.shutdown_tx.send(true).unwrap();
+    }
+
+    pub fn address(&self) -> Option<&str> {
+        self.address.as_deref()
+    }
+
     pub fn net_state(&self) -> NetState {
         self.net_state.load(Ordering::Relaxed)
     }
+}
 
-    pub fn mode(&self) -> Mode {
-        self.mode
+pub struct Server {
+    port: Option<u16>,
+    net_state: Arc<AtomicNetState>,
+    connections: Vec<Connection>,
+    logs: Vec<Log>,
+
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+
+    log_tx: tokio::sync::mpsc::Sender<Log>,
+    log_rx: tokio::sync::mpsc::Receiver<Log>,
+}
+
+impl Server {
+    pub fn new() -> Self {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (log_tx, log_rx) = tokio::sync::mpsc::channel(1024);
+
+        Self {
+            port: None,
+            net_state: Arc::new(AtomicNetState::new(NetState::default())),
+            connections: Vec::new(),
+            logs: Vec::new(),
+
+            shutdown_tx,
+            shutdown_rx,
+            log_tx,
+            log_rx,
+        }
     }
 
-    pub fn set_mode(&mut self, mode: Mode) {
-        self.mode = mode;
+    pub fn start(&mut self, port: u16) {
+        if self.net_state() != NetState::Inactive {
+            panic!("Cannot start_server if server establishing or already established")
+        }
+        self.port = Some(port);
+
+        // TODO
+    }
+
+    pub fn update_and_read_logs(&mut self) -> &Vec<Log> {
+        while let Ok(log) = self.log_rx.try_recv() {
+            self.logs.push(log);
+        }
+        &self.logs
+    }
+
+    pub fn update_and_read_logs_for(&mut self, connection_addr: &str) -> &Vec<Log> {
+        self.connection_from_addr_mut(connection_addr)
+            .unwrap()
+            .update_and_read_logs()
+    }
+
+    pub fn connection_from_addr(&self, address: &str) -> Option<&Connection> {
+        self.connections
+            .iter()
+            .find(|c| c.address.as_deref() == Some(address))
+    }
+
+    pub fn connection_from_addr_mut(&mut self, address: &str) -> Option<&mut Connection> {
+        self.connections
+            .iter_mut()
+            .find(|c| c.address.as_deref() == Some(address))
+    }
+
+    pub fn net_state(&self) -> NetState {
+        self.net_state.load(Ordering::Relaxed)
     }
 }
 
@@ -206,12 +260,12 @@ impl Log {
         }
     }
 
-    pub fn connect() -> Self {
-        Self::new(LogData::Connect)
+    pub fn connect(address: String) -> Self {
+        Self::new(LogData::ClientConnect(address))
     }
 
-    pub fn disconnect() -> Self {
-        Self::new(LogData::Disconnect)
+    pub fn disconnect(address: String) -> Self {
+        Self::new(LogData::ClientDisconnect(address))
     }
 
     pub fn received(data: DataPacket) -> Self {
@@ -233,8 +287,8 @@ impl Log {
 
 #[derive(Debug)]
 pub enum LogData {
-    Connect,
-    Disconnect,
+    ClientConnect(String),
+    ClientDisconnect(String),
     ReceivedPacket(DataPacket),
     SentPacket(DataPacket),
     ConnectError(std::io::Error),
