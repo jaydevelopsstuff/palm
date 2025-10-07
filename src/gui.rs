@@ -1,8 +1,17 @@
-use std::sync::Arc;
+use std::{ops::Not, sync::Arc};
 
+use eframe::egui::{
+    self, Align, Button, CentralPanel, Label, Layout, ScrollArea, Sense, Stroke, TextEdit,
+    TopBottomPanel, UiBuilder,
+};
+use egui_tiles::{Behavior, Tile, TileId};
 use tokio::runtime::Runtime;
 
-use crate::backend::{Connection, Log, LogData, Mode, NetState, Server};
+use crate::{
+    backend::{Connection, Log, LogData, Mode, NetState, Server},
+    hexedit::HexEditor,
+    util::hex_encode_formatted,
+};
 
 pub struct ClientUI {
     pub address: String,
@@ -388,5 +397,332 @@ impl Tab {
                 self.server = Some(ServerUI::new())
             }
         }
+    }
+}
+
+pub enum Pane {
+    Tab(Tab),
+}
+
+#[derive(Default)]
+pub struct TreeBehavior {
+    pub spawn_tab_into: Option<TileId>,
+}
+
+impl Behavior<Pane> for TreeBehavior {
+    fn tab_title_for_pane(&mut self, pane: &Pane) -> eframe::egui::WidgetText {
+        match pane {
+            Pane::Tab(tab) => {
+                let detailed_title = match (
+                    tab.client_safe().and_then(|c| Some(c.address.trim())),
+                    tab.server_safe().and_then(|s| Some(s.port.trim())),
+                ) {
+                    (Some(client_addr), None) => client_addr
+                        .is_empty()
+                        .not()
+                        .then(|| client_addr.to_string()),
+                    (None, Some(server_port)) => server_port
+                        .is_empty()
+                        .not()
+                        .then(|| format!("Server on {server_port}")),
+                    _ => unreachable!(),
+                };
+
+                if let Some(detailed_title) = detailed_title {
+                    detailed_title.into()
+                } else {
+                    format!("{} Tab {}", tab.mode(), tab.id).into()
+                }
+            }
+        }
+    }
+
+    fn pane_ui(
+        &mut self,
+        ui: &mut eframe::egui::Ui,
+        tile_id: egui_tiles::TileId,
+        pane: &mut Pane,
+    ) -> egui_tiles::UiResponse {
+        match pane {
+            Pane::Tab(tab) => {
+                TopBottomPanel::top(format!("tab-mode-selector:{}", tab.id)).show_inside(
+                    ui,
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    tab.net_state() == NetState::Inactive,
+                                    Button::new("Client").selected(tab.mode() == Mode::Client),
+                                )
+                                .clicked()
+                            {
+                                tab.set_mode(Mode::Client);
+                            }
+                            if ui
+                                .add_enabled(
+                                    tab.net_state() == NetState::Inactive,
+                                    Button::new("Server").selected(tab.mode() == Mode::Server),
+                                )
+                                .clicked()
+                            {
+                                tab.set_mode(Mode::Server);
+                            }
+                            ui.separator();
+                            if tab.mode() == Mode::Client {
+                                let net_state = tab.net_state();
+                                ui.add(
+                                    TextEdit::singleline(&mut tab.client_mut().address)
+                                        .desired_width(172.0)
+                                        .hint_text("127.0.0.1:54321")
+                                        .interactive(net_state == NetState::Inactive),
+                                );
+                                match tab.net_state() {
+                                    NetState::Inactive => {
+                                        if ui.button("Connect").clicked() {
+                                            tab.start_client();
+                                        }
+                                    }
+                                    NetState::Active => {
+                                        if ui.button("Disconnect").clicked() {
+                                            tab.client().backend().shutdown();
+                                        }
+                                    }
+                                    NetState::Establishing => {
+                                        ui.add_enabled(false, Button::new("Connecting"));
+                                    }
+                                };
+                            } else if tab.mode() == Mode::Server {
+                                let net_state = tab.net_state();
+                                ui.add(
+                                    TextEdit::singleline(&mut tab.server_mut().port)
+                                        .desired_width(72.)
+                                        .hint_text("54321")
+                                        .interactive(net_state == NetState::Inactive),
+                                );
+                                match tab.net_state() {
+                                    NetState::Inactive => {
+                                        if ui.button("Start").clicked() {
+                                            tab.start_server();
+                                        }
+                                    }
+                                    NetState::Active => {
+                                        if ui.button("Stop").clicked() {
+                                            tab.server().backend().shutdown();
+                                        }
+                                    }
+                                    NetState::Establishing => {
+                                        ui.add_enabled(false, Button::new("Starting"));
+                                    }
+                                };
+                                if !tab.server().is_server_log_focused() {
+                                    if ui.button("End Focused Connection").clicked() {
+                                        tab.server()
+                                            .focused_connection_ui()
+                                            .unwrap()
+                                            .with_backend(tab.server(), |c| c.shutdown())
+                                    }
+                                }
+                            }
+                        });
+                    },
+                );
+                TopBottomPanel::bottom(format!("tab-input:{}", tab.id))
+                    .resizable(true)
+                    .show_inside(ui, |ui| {
+                        ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
+                            let mut empty_draft_data = Vec::new();
+                            let draft_data = tab.draft_data_mut();
+                            let draft_data_len = draft_data.as_ref().and_then(|d| Some(d.len()));
+
+                            ui.add_sized(
+                                (
+                                    ui.available_width() - 64.,
+                                    ui.available_height() - ui.spacing().item_spacing.y,
+                                ),
+                                HexEditor::new(draft_data.unwrap_or(&mut empty_draft_data)),
+                            );
+                            if ui
+                                .add_enabled(
+                                    tab.net_state() == NetState::Active
+                                        && draft_data_len != None
+                                        && draft_data_len != Some(0),
+                                    Button::new("Send"),
+                                )
+                                .clicked()
+                            {
+                                tab.send_data().unwrap();
+                            }
+                        });
+                    });
+                if tab.mode() == Mode::Server {
+                    TopBottomPanel::top(format!("tab-server-tabs:{}", tab.id)).show_inside(
+                        ui,
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(
+                                        Button::new("Server Log")
+                                            .selected(tab.server().is_server_log_focused()),
+                                    )
+                                    .clicked()
+                                {
+                                    tab.server_mut().set_focused_connection(None);
+                                }
+                                let mut clicked_conn_addr = None;
+                                let mut close_conn_tab_addr = None;
+                                for conn in tab.server().connection_uis() {
+                                    if ui
+                                        .add(Button::new(conn.address()).selected(
+                                            Some(conn.address())
+                                                == tab.server().focused_connection(),
+                                        ))
+                                        .clicked()
+                                    {
+                                        clicked_conn_addr = Some(conn.address().to_string());
+                                    }
+                                    ui.add_space(-7.);
+                                    if ui
+                                        .add_enabled(
+                                            conn.net_state(tab.server()) == NetState::Inactive,
+                                            Button::new("X"),
+                                        )
+                                        .clicked()
+                                    {
+                                        close_conn_tab_addr = Some(conn.address().to_string());
+                                    }
+                                }
+                                if let Some(clicked_conn_addr) = clicked_conn_addr {
+                                    tab.server_mut()
+                                        .set_focused_connection(Some(clicked_conn_addr));
+                                }
+                                if let Some(addr) = close_conn_tab_addr {
+                                    tab.server_mut().close_connection_ui(&addr);
+                                }
+                            });
+                        },
+                    );
+                }
+                CentralPanel::default().show_inside(ui, |ui| {
+                    ScrollArea::vertical().show(ui, |ui| {
+                        let server_log_focused = matches!(
+                            tab.server_safe()
+                                .and_then(|s| Some(s.is_server_log_focused())),
+                            Some(true)
+                        );
+
+                        for log in tab.update_and_read_logs() {
+                            ui.horizontal(|ui| {
+                                ui.monospace(log.timestamp.format("%H:%M:%S").to_string());
+                                match &log.data {
+                                    LogData::ClientConnect(addr) => {
+                                        ui.monospace(if server_log_focused {
+                                            format!("{} Connected", addr)
+                                        } else {
+                                            "Connected".into()
+                                        });
+                                    }
+                                    LogData::ClientDisconnect(addr) => {
+                                        ui.monospace(if server_log_focused {
+                                            format!("{} Disconnected", addr)
+                                        } else {
+                                            "Disconnected".into()
+                                        });
+                                    }
+                                    LogData::SentPacket(packet) => {
+                                        ui.add_sized((108., 20.), Label::new("You"));
+                                        let mut hex_formatted = hex_encode_formatted(&packet.data);
+                                        ui.add(
+                                            TextEdit::multiline(&mut hex_formatted)
+                                                .code_editor()
+                                                .desired_width(f32::INFINITY),
+                                        );
+                                    }
+                                    LogData::ServerStarted => {
+                                        ui.monospace("Server Started");
+                                    }
+                                    LogData::ServerStopped => {
+                                        ui.monospace("Server Stopped");
+                                    }
+                                    LogData::ReceivedPacket(packet) => {
+                                        ui.add_sized((108., 20.), Label::new(&packet.address));
+                                        let mut hex_formatted = hex_encode_formatted(&packet.data);
+                                        ui.add(
+                                            TextEdit::multiline(&mut hex_formatted)
+                                                .code_editor()
+                                                .desired_width(f32::INFINITY),
+                                        );
+                                    }
+                                    LogData::ConnectTimedOut => {
+                                        ui.monospace("Failed to Connect: Timed Out");
+                                    }
+                                    LogData::ConnectError(error) => {
+                                        ui.monospace(format!("Failed to Connect: {}", error));
+                                    }
+                                    LogData::FatalReadError(error) => {
+                                        ui.monospace(format!("Fatal Read Error: {error}"));
+                                    }
+                                    LogData::ServerStartError(error) => {
+                                        ui.monospace(format!("Failed to Start Server: {error}"));
+                                    }
+                                };
+                            });
+                        }
+                    });
+                });
+            }
+        }
+
+        egui_tiles::UiResponse::None
+    }
+
+    fn top_bar_right_ui(
+        &mut self,
+        _tiles: &egui_tiles::Tiles<Pane>,
+        ui: &mut eframe::egui::Ui,
+        tile_id: egui_tiles::TileId,
+        _tabs: &egui_tiles::Tabs,
+        _scroll_offset: &mut f32,
+    ) {
+        ui.scope(|ui| {
+            let style = ui.style_mut();
+            style.visuals.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+            style.visuals.widgets.hovered.bg_stroke = Stroke::NONE;
+
+            if ui.button("➕").clicked() {
+                self.spawn_tab_into = Some(tile_id);
+            }
+        });
+    }
+
+    fn on_tab_close(
+        &mut self,
+        tiles: &mut egui_tiles::Tiles<Pane>,
+        tile_id: egui_tiles::TileId,
+    ) -> bool {
+        if let Some(Tile::Pane(Pane::Tab(tab))) = tiles.get(tile_id) {
+            tab.net_state() == NetState::Inactive
+        } else {
+            true
+        }
+    }
+
+    fn is_tab_closable(
+        &self,
+        tiles: &egui_tiles::Tiles<Pane>,
+        tile_id: egui_tiles::TileId,
+    ) -> bool {
+        if let Some(Tile::Pane(Pane::Tab(tab))) = tiles.get(tile_id) {
+            tab.net_state() == NetState::Inactive
+        } else {
+            true
+        }
+    }
+
+    fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
+        let mut options = egui_tiles::SimplificationOptions::default();
+
+        options.all_panes_must_have_tabs = true;
+
+        options
     }
 }

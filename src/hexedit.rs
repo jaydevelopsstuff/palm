@@ -177,12 +177,17 @@ impl Widget for HexEditor<'_> {
     fn ui(mut self, ui: &mut egui::Ui) -> egui::Response {
         let mut event_results = vec![];
 
+        // Consume events pertaining to the Hex Editor's behavior and temporarily store them
+        let mut consumed_events = Vec::new();
         ui.input_mut(|i| {
             i.events.retain(|event| {
                 let (result, should_consume) = self.handle_event(&event, ui.ctx());
 
                 event_results.push(result);
 
+                if should_consume {
+                    consumed_events.push(event.clone())
+                }
                 !should_consume
             });
         });
@@ -255,6 +260,11 @@ impl Widget for HexEditor<'_> {
         self.sync_view();
         ui.data_mut(|w| w.insert_temp(output.response.id, partial_nibble));
         state.store(ui.ctx(), output.response.id);
+
+        // Restore temporarily consumed events if we don't have focus
+        if !output.response.has_focus() {
+            ui.input_mut(|w| w.events.append(&mut consumed_events));
+        }
 
         output.response
     }

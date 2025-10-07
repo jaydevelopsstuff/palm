@@ -297,9 +297,17 @@ impl Server {
         let net_state = self.net_state.clone();
         rt.spawn(async move {
             net_state.store(NetState::Establishing, Ordering::Relaxed);
-            let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port))
-                .await
-                .unwrap();
+            let listener = match TcpListener::bind(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port))
+                .await {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        info!("Failed to to start server on port {port}: {error}");
+                        log_tx.send(Log::server_start_error(error)).await.unwrap();
+                        net_state.store(NetState::Inactive, Ordering::Relaxed);
+                        return;
+                    }
+                };
+
 
             net_state.store(NetState::Active, Ordering::Relaxed);
             info!("Server Started on Port {}", port);
@@ -417,6 +425,10 @@ impl Log {
         Self::new(LogData::ConnectTimedOut)
     }
 
+    pub fn server_start_error(error: std::io::Error) -> Self {
+        Self::new(LogData::ServerStartError(Arc::new(error)))
+    }
+
     pub fn fatal_read_error(error: std::io::Error) -> Self {
         Self::new(LogData::FatalReadError(Arc::new(error)))
     }
@@ -432,6 +444,7 @@ pub enum LogData {
     SentPacket(DataPacket),
     ConnectError(Arc<std::io::Error>),
     ConnectTimedOut,
+    ServerStartError(Arc<std::io::Error>),
     FatalReadError(Arc<std::io::Error>),
 }
 
