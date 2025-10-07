@@ -1,4 +1,5 @@
 #![feature(mpmc_channel)]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
 use std::f32;
 use std::sync::Arc;
