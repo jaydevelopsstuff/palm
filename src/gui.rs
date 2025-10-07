@@ -1,8 +1,8 @@
 use std::{ops::Not, sync::Arc};
 
 use eframe::egui::{
-    self, Align, Button, CentralPanel, Label, Layout, ScrollArea, Sense, Stroke, TextEdit,
-    TopBottomPanel, UiBuilder,
+    self, Align, Button, CentralPanel, Label, Layout, ScrollArea, Stroke, TextEdit,
+    TopBottomPanel,
 };
 use egui_tiles::{Behavior, Tile, TileId};
 use tokio::runtime::Runtime;

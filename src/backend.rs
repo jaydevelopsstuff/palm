@@ -6,7 +6,7 @@ use std::{
 
 use atomic_enum::atomic_enum;
 use chrono::DateTime;
-use log::{debug, info};
+use log::info;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},

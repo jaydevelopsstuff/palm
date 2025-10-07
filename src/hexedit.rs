@@ -1,8 +1,6 @@
-use eframe::egui::text::CCursorRange;
 use eframe::egui::text_edit::TextEditState;
 use eframe::egui::{self, TextEdit};
 use eframe::egui::{Key, Widget};
-use eframe::epaint::text::cursor;
 use regex::Regex;
 
 use crate::util::hex_encode_formatted;
