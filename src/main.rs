@@ -1,11 +1,8 @@
-#![feature(mpmc_channel)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
 use std::sync::Arc;
 
-use eframe::egui::{
-    CentralPanel, Context,
-};
+use eframe::egui::{CentralPanel, Context};
 use eframe::{egui, Frame};
 use egui_tiles::TileId;
 use simplelog::*;
